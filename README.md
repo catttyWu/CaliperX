@@ -231,7 +231,221 @@ struct RoundnessResult {
 
 ---
 
-## 五、工业级算法实现建议
+## 五、椭圆检测算法详解
+
+### 5.1 椭圆检测概述
+
+椭圆是圆的一般化形式，在工业检测中广泛应用：
+- **斜孔/斜面圆** - 视角倾斜导致的圆投影为椭圆
+- **圆柱体端面** - 倾斜拍摄的圆形端面
+- **O型圈/密封圈** - 椭圆度测量
+- **机械零件** - 椭圆轴承、凸轮轮廓
+
+### 5.2 椭圆与圆的数学表示对比
+
+| 特征 | 圆 | 椭圆 |
+|-----|-----|------|
+| **参数数量** | 3 (a, b, r) | **5 (a, b, φ, A, B)** |
+| **自由度** | 位置+半径 | 位置+长短轴+旋转角 |
+| **拟合难度** | 简单 | **复杂** |
+| **精度要求** | 低 | **高** |
+
+**椭圆标准方程**（中心在原点，旋转角φ）：
+```
+((x-a)cosφ + (y-b)sinφ)²/A² + (-(x-a)sinφ + (y-b)cosφ)²/B² = 1
+
+参数：
+(a,b) - 中心坐标
+A,B   - 长半轴、短半轴 (A ≥ B)
+φ     - 旋转角 (0 ≤ φ < π)
+```
+
+### 5.3 椭圆检测方法对比
+
+| 方法 | 原理 | 精度 | 鲁棒性 | 计算量 | 适用场景 |
+|-----|------|-----|-------|-------|---------|
+| **霍夫变换(5D)** | 5维参数空间投票 | ±1px | ⭐⭐ | ⭐⭐⭐⭐⭐ 极高 | 简单场景、粗定位 |
+| **随机霍夫变换(RHT)** | 随机采样降维 | ±0.5px | ⭐⭐⭐ | ⭐⭐⭐ 高 | 多椭圆检测 |
+| **直接最小二乘** | 线性代数拟合 | ±0.1px | ⭐⭐ | ⭐ 低 | 理想数据 |
+| **正交距离拟合** | 几何距离最小化 | **±0.01px** | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ 高 | **精密测量首选** |
+| **基于弧段拟合** | 先分段再整体拟合 | ±0.05px | ⭐⭐⭐⭐⭐ | ⭐⭐ 中 | 遮挡、缺段场景 |
+
+### 5.4 直接最小二乘椭圆拟合
+
+#### 5.4.1 线性化方法（Fitzgibbon）
+```cpp
+// 二次曲线一般方程: ax² + bxy + cy² + dx + ey + f = 0
+// 约束: b² - 4ac < 0 (保证是椭圆)
+
+// 矩阵形式: D·a = 0
+// D = [x², xy, y², x, y, 1]  (N×6)
+// a = [a, b, c, d, e, f]ᵀ
+
+// 广义特征值求解: Sa = λCa
+// S = DᵀD (散度矩阵)
+// C = 约束矩阵 (保证椭圆条件)
+
+// 最小特征值对应的特征向量即为解
+```
+- **优点**：解析解、计算快
+- **缺点**：有偏估计、对噪声敏感
+- **精度**：±0.1-0.3像素
+
+#### 5.4.2 归一化DLT方法
+```cpp
+// 1. 数据归一化：平移+缩放使数据中心化、单位方差
+// 2. 求解归一化坐标系下的椭圆参数
+// 3. 反归一化得到原始坐标系参数
+
+// 数值稳定性大幅提升
+```
+- **优点**：数值稳定
+- **精度**：±0.05-0.1像素
+
+### 5.5 正交距离椭圆拟合（高精度）
+
+#### 5.5.1 几何距离定义
+```cpp
+// 点P到椭圆的几何距离
+// = |P - P_ellipse| 
+// 其中P_ellipse是椭圆上距离P最近的点
+
+// 非线性优化目标: min Σ|P_i - P_ellipse_i|²
+// 参数: [a, b, A, B, φ] (5个)
+```
+
+#### 5.5.2 Sampson距离近似
+```cpp
+// 避免迭代求解最近点，使用一阶近似
+
+// Sampson距离: d = |ax² + bxy + cy² + dx + ey + f| / √(∇F·∇F)
+
+// 比代数距离更准确
+// 比几何距离更快
+```
+
+#### 5.5.3 Levenberg-Marquardt迭代
+```cpp
+// 完整几何距离拟合
+// 雅可比矩阵 J = ∂d/∂θ
+// 其中 θ = [a, b, A, B, φ]
+
+// 迭代: θ = θ - (JᵀJ + λI)⁻¹·Jᵀ·r
+// r为残差向量
+
+// 需要好的初值（可用直接最小二乘结果）
+```
+- **精度**：**±0.01像素**
+- **缺点**：计算量大、需要初值
+
+### 5.6 Halcon椭圆检测方案
+
+```cpp
+// Halcon提供两种椭圆拟合方式
+
+// 1. 代数拟合（快速）
+fit_ellipse_contour_xld(Contour, 'fitzgibbon', -1, 0, 0, 3, 2, Row, Column, Phi, Radius1, Radius2)
+
+// 2. 几何拟合（高精度）
+fit_ellipse_contour_xld(Contour, 'geotukey', -1, 0, 0, 3, 2, Row, Column, Phi, Radius1, Radius2)
+// geotukey / geohuber / geohuber_approx
+
+// 外接矩形方式（用于测量）
+smallest_rectangle2_xld(Contour, Row, Column, Phi, Length1, Length2)
+```
+
+### 5.7 椭圆参数计算与转换
+
+```cpp
+// 从二次曲线系数 [a,b,c,d,e,f] 转换到几何参数
+struct EllipseParams {
+    Point2f center;      // (a, b)
+    float majorAxis;     // 2A (长轴)
+    float minorAxis;     // 2B (短轴)
+    float angle;         // φ (旋转角，弧度)
+    float eccentricity;  // e = √(1 - B²/A²) (离心率)
+};
+
+// 椭圆度计算
+float ellipticity = (A - B) / A * 100%;  // 百分比表示
+
+// 倾斜角补偿（相机标定后）
+float trueDiameter = A * cos(θ) + B * sin(θ);  // θ为倾斜角
+```
+
+### 5.8 椭圆卡尺阵列设计
+
+```cpp
+// 椭圆专用卡尺：沿椭圆法线方向扫描
+struct EllipticCaliper {
+    Point2f center;
+    float majorAxis;
+    float minorAxis;
+    float angle;
+    int numCalipers;
+    
+    // 生成椭圆法向卡尺
+    vector<pair<Point2f, Point2f>> generateCalipers() {
+        vector<pair<Point2f, Point2f>> calipers;
+        for (int i = 0; i < numCalipers; i++) {
+            float theta = 2 * PI * i / numCalipers;
+            
+            // 椭圆上点的参数方程
+            float x = center.x + majorAxis * cos(theta) * cos(angle) 
+                              - minorAxis * sin(theta) * sin(angle);
+            float y = center.y + majorAxis * cos(theta) * sin(angle) 
+                              + minorAxis * sin(theta) * cos(angle);
+            
+            // 计算法线方向（梯度方向）
+            float dx = -majorAxis * sin(theta) * cos(angle) 
+                       - minorAxis * cos(theta) * sin(angle);
+            float dy = -majorAxis * sin(theta) * sin(angle) 
+                       + minorAxis * cos(theta) * cos(angle);
+            
+            // 归一化
+            float norm = sqrt(dx*dx + dy*dy);
+            dx /= norm; dy /= norm;
+            
+            // 卡尺线（沿法线方向）
+            Point2f start(x - 10*dx, y - 10*dy);
+            Point2f end(x + 10*dx, y + 10*dy);
+            calipers.push_back({start, end});
+        }
+        return calipers;
+    }
+};
+```
+
+### 5.9 椭圆度测量应用
+
+#### 5.9.1 O型圈椭圆度检测
+- **测量指标**：椭圆度 = (D_max - D_min) / D_avg × 100%
+- **合格标准**：通常 < 5%
+- **方案**：椭圆拟合 → 计算长短轴 → 求椭圆度
+
+#### 5.9.2 斜孔真圆度补偿
+- **问题**：倾斜拍摄的圆孔呈椭圆
+- **方法**：
+  1. 椭圆拟合得到长短轴 A, B
+  2. 已知倾斜角 θ，计算真实直径：D = 2√((A·cosθ)² + (B·sinθ)²)
+  3. 或直接测量椭圆面积再换算：S = πAB，等效圆直径 = 2√(AB)
+
+#### 5.9.3 轴承椭圆滚道检测
+- **精度要求**：椭圆度 < 0.1%
+- **方案**：高精度正交距离拟合 + 统计椭圆度分布
+
+### 5.10 厂商椭圆检测方案
+
+| 厂商 | 椭圆检测方法 | 精度 | 特点 |
+|-----|-------------|------|------|
+| **Halcon** | 代数/几何拟合 | ±0.01px | 参数完整，含椭圆度计算 |
+| **Cognex** | PatMax + Ellipse | ±0.02px | 与模板匹配结合 |
+| **海康VM** | 最小二乘拟合 | ±0.05px | 基础功能 |
+| **OpenCV** | fitEllipse | ±0.1px | 代数拟合，需自行优化 |
+
+---
+
+## 六、工业级算法实现建议
 
 ### 4.1 推荐技术栈
 
@@ -367,6 +581,12 @@ caliper_config:
 4. **Taubin, G.** "Estimation of planar curves, surfaces, and nonplanar space curves" (1991) - 代数距离拟合
 5. **Chernov, N.** "Circular and linear regression: Fitting circles and lines by least squares" (2010) - 几何拟合理论
 6. **Ahn, S.J.** "Least-squares orthogonal distances fitting of circle, sphere, ellipse, hyperbola, and parabola" (2004) - 正交距离拟合
+
+### 论文 - 椭圆检测
+7. **Fitzgibbon, A.W.** "Direct least square fitting of ellipses" (1999) - 直接最小二乘椭圆拟合经典算法
+8. **Halir, R., Flusser, J.** "Numerically stable direct least squares fitting of ellipses" (1998) - 数值稳定的椭圆拟合
+9. **Szpak, Z.L.** "Robust ellipse fitting with a Bayesian estimator and random sampling" (2015) - 贝叶斯鲁棒椭圆拟合
+10. **Zhang, Z.** "Parameter estimation techniques: A tutorial with application to conic fitting" (1997) - 圆锥曲线拟合综述
 
 ### 开源项目
 - OpenCV: `cv::moments()`, `cv::Sobel()`
