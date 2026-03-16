@@ -17,6 +17,8 @@
 | 汽车零部件测量 | ±0.05mm | 汽车 |
 | 机械加工件检测 | ±0.02mm | 精密制造 |
 | PCB板尺寸检测 | ±0.005mm | 电子制造 |
+| **圆孔/轴径测量** | **±0.002mm** | **精密加工** |
+| **轴承滚道检测** | **±0.001mm** | **高端制造** |
 
 ---
 
@@ -87,7 +89,149 @@ struct EdgeParams {
 
 ---
 
-## 四、工业级算法实现建议
+## 四、圆检测算法详解
+
+### 4.1 圆形卡尺检测概述
+
+圆形卡尺检测（Circular Caliper）是沿圆周或圆弧路径检测边缘，用于测量：
+- **圆直径/半径** - 孔径、轴径测量
+- **圆度误差** - 形状精度评估
+- **同心度** - 多圆中心偏差
+- **圆弧角度** - 扇形工件测量
+
+### 4.2 圆检测方法对比
+
+| 方法 | 原理 | 精度 | 鲁棒性 | 计算量 | 适用场景 |
+|-----|------|-----|-------|-------|---------|
+| **霍夫变换** | 参数空间投票 | ±0.5px | ⭐⭐⭐ | ⭐⭐⭐⭐ 高 | 粗定位、多圆检测 |
+| **最小二乘拟合** | 代数/几何距离最小化 | **±0.01px** | ⭐⭐⭐⭐ | ⭐⭐ 中 | **精密测量首选** |
+| **RANSAC拟合** | 随机采样一致性 | ±0.05px | ⭐⭐⭐⭐⭐ | ⭐⭐⭐ 较高 | 噪声大、离群点多 |
+| **亚像素边缘+拟合** | 先提取边缘再拟合 | **±0.005px** | ⭐⭐⭐⭐ | ⭐⭐⭐⭐ 高 | **最高精度** |
+| **卡尺阵列扫描** | 多方向边缘检测 | ±0.02px | ⭐⭐⭐⭐ | ⭐⭐ 中 | 工业现场常用 |
+
+### 4.3 最小二乘圆拟合（工业标准）
+
+#### 4.3.1 代数拟合（Kasa方法）
+```cpp
+// 圆方程: (x-a)² + (y-b)² = r²
+// 展开: x² + y² + Dx + Ey + F = 0
+// 其中: a = -D/2, b = -E/2, r = √(a² + b² - F)
+
+// 线性最小二乘求解
+// A = [x y 1], b = -(x² + y²)
+// 求解 Ax = b 得到 D, E, F
+```
+- **优点**：解析解、计算快
+- **缺点**：有偏估计，小圆弧误差大
+- **精度**：±0.1-0.5像素
+
+#### 4.3.2 几何拟合（Gauss-Newton迭代）
+```cpp
+// 最小化几何距离: Σ(√((xi-a)² + (yi-b)²) - r)²
+// 非线性优化，需迭代求解
+
+// 雅可比矩阵计算偏导数
+// 迭代更新: [a, b, r] = [a, b, r] - J⁺·residual
+```
+- **优点**：无偏估计、精度高
+- **缺点**：需要初值、计算量大
+- **精度**：**±0.01像素**，可达亚微米级
+
+#### 4.3.3 超定方程拟合（Halcon方法）
+```cpp
+// 基于代数距离的几何校正
+// 1. 先用代数拟合得到初值
+// 2. 权重迭代: wi = 1 / |distance_i|
+// 3. 加权最小二乘直到收敛
+```
+- **精度**：±0.02像素
+- **鲁棒性**：优于纯代数拟合
+
+### 4.4 亚像素圆检测流程
+
+```
+┌────────────────┐    ┌────────────────┐    ┌────────────────┐
+│  1. 粗定位     │ → │  2. 边缘提取   │ → │  3. 精拟合     │
+│  (Coarse)      │    │  (Edge Detect) │    │  (Refinement)  │
+└────────────────┘    └────────────────┘    └────────────────┘
+       │                     │                     │
+       ▼                     ▼                     ▼
+   霍夫变换/           卡尺阵列扫描          几何最小二乘
+   模板匹配            亚像素边缘定位         RANSAC去噪
+   得到圆心初值        获取边缘点集           迭代优化参数
+```
+
+### 4.5 圆形卡尺阵列设计
+
+```cpp
+// 工业常用：多方向卡尺扫描
+struct CircularCaliper {
+    Point2f center;      // 圆心初始位置
+    float radius;        // 初始半径
+    int numCalipers;     // 卡尺数量(通常8-36个)
+    float caliperLength; // 卡尺长度
+    
+    // 生成卡尺线（径向分布）
+    vector<pair<Point2f, Point2f>> generateCalipers() {
+        vector<pair<Point2f, Point2f>> calipers;
+        for (int i = 0; i < numCalipers; i++) {
+            float angle = 2 * PI * i / numCalipers;
+            Point2f dir(cos(angle), sin(angle));
+            Point2f start = center + (radius - caliperLength/2) * dir;
+            Point2f end = center + (radius + caliperLength/2) * dir;
+            calipers.push_back({start, end});
+        }
+        return calipers;
+    }
+};
+```
+
+### 4.6 圆度误差计算
+
+```cpp
+// 圆度误差 = max(Ri) - min(Ri)
+// 其中Ri为各边缘点到拟合圆心的距离
+
+// 评估指标
+struct RoundnessResult {
+    float roundnessError;    // 圆度误差
+    float maxRadius;         // 最大半径
+    float minRadius;         // 最小半径
+    float avgRadius;         // 平均半径
+    vector<float> radiusVariation; // 半径偏差分布
+};
+```
+
+### 4.7 厂商圆检测方案对比
+
+| 厂商 | 圆检测方法 | 直径精度 | 圆度精度 | 特点 |
+|-----|-----------|---------|---------|------|
+| **Halcon** | 几何拟合+卡尺 | ±0.005px | ±0.003px | **精度最高** |
+| **Cognex** | PatMax+Circle | ±0.01px | ±0.005px | 速度快 |
+| **海康VM** | 最小二乘 | ±0.03px | ±0.02px | 性价比高 |
+| **基恩士** | 专用圆检测 | ±0.02px | ±0.01px | 易用性强 |
+
+### 4.8 典型圆检测应用
+
+#### 4.8.1 轴承滚道检测
+- **精度要求**：直径±0.001mm，圆度0.0005mm
+- **方案**：36方向卡尺 + 亚像素边缘 + 几何拟合
+- **难点**：反光曲面、边缘模糊
+- **解决**：多角度光源 + 自适应阈值
+
+#### 4.8.2 精密孔径测量
+- **精度要求**：±0.002mm（φ0.5-50mm孔）
+- **方案**：背光照明 + 双圆检测（内外边缘）
+- **特殊处理**：毛刺过滤 + 边缘平滑
+
+#### 4.8.3 齿轮内孔同心度
+- **精度要求**：同心度±0.005mm
+- **方案**：多圆同时检测 + 中心偏差计算
+- **算法**：同心圆约束优化
+
+---
+
+## 五、工业级算法实现建议
 
 ### 4.1 推荐技术栈
 
@@ -144,7 +288,7 @@ caliper_config:
 
 ---
 
-## 五、性能对比实测数据
+## 六、性能对比实测数据
 
 ### 5.1 不同算法精度测试（模拟数据）
 
@@ -166,7 +310,7 @@ caliper_config:
 
 ---
 
-## 六、典型应用案例
+## 七、典型应用案例
 
 ### 6.1 案例1：手机中框尺寸检测
 - **精度要求**：±0.01mm
@@ -187,7 +331,7 @@ caliper_config:
 
 ---
 
-## 七、开发路线图
+## 八、开发路线图
 
 ### Phase 1：基础实现（1-2周）
 - [ ] 灰度投影实现
@@ -212,11 +356,17 @@ caliper_config:
 
 ---
 
-## 八、参考资源
+## 九、参考资源
 
-### 论文
+### 论文 - 边缘检测
 1. Ghosal S., Mehrotra R. "Orthogonal moment operators for subpixel edge detection" (1993)
 2. Lyvers E.P. "Subpixel measurements using a moment-based edge operator" (1989)
+
+### 论文 - 圆检测
+3. **Kasa, I.** "A curve fitting procedure and its error analysis" (1976) - 代数圆拟合
+4. **Taubin, G.** "Estimation of planar curves, surfaces, and nonplanar space curves" (1991) - 代数距离拟合
+5. **Chernov, N.** "Circular and linear regression: Fitting circles and lines by least squares" (2010) - 几何拟合理论
+6. **Ahn, S.J.** "Least-squares orthogonal distances fitting of circle, sphere, ellipse, hyperbola, and parabola" (2004) - 正交距离拟合
 
 ### 开源项目
 - OpenCV: `cv::moments()`, `cv::Sobel()`
@@ -228,7 +378,7 @@ caliper_config:
 
 ---
 
-## 九、总结与建议
+## 十、总结与建议
 
 | 场景 | 推荐算法 | 预期精度 | 开发周期 |
 |-----|---------|---------|---------|
